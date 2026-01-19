@@ -1,35 +1,26 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
-#include <sys/stat.h>
 #include <stdint.h>
+#include <string.h>
+#include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <errno.h>
-#include <endian.h>
 
-#include "ed25519.h"
+#include <sodium.h>
 
 #define KEY_DIR     "/etc/wifi-secure"
-#define KEY_PATH    KEY_DIR "/ed25519.key"
-#define PUBKEY_PATH KEY_DIR "/ed25519.pub"
+#define KEY_PATH    "/etc/wifi-secure/ed25519.key"
+#define PUBKEY_PATH "/etc/wifi-secure/ed25519.pub"
 
-#define OUI0 0x00
-#define OUI1 0x11
-#define OUI2 0x22
-#define VSIE_TYPE 0x01
+#define VSIE_LEN (4 + crypto_sign_PUBLICKEYBYTES + 8 + crypto_sign_BYTES)
 
-#define VSIE_LEN (4 + 32 + 8 + 64)
+/* ------------------------------------------------ */
 
 static void die(const char *msg) {
     perror(msg);
-    exit(EXIT_FAILURE);
-}
-
-static void secure_bzero(void *p, size_t n) {
-    volatile uint8_t *v = (volatile uint8_t *)p;
-    while (n--) *v++ = 0;
+    exit(1);
 }
 
 static int file_exists(const char *path) {
@@ -39,138 +30,124 @@ static int file_exists(const char *path) {
 static void get_random(uint8_t *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) die("open urandom");
-    ssize_t r = read(fd, buf, len);
+    if (read(fd, buf, len) != (ssize_t)len) die("read urandom");
     close(fd);
-    if (r != (ssize_t)len) die("read urandom");
 }
 
+/* ------------------------------------------------ */
+/* Key generation                                   */
+/* ------------------------------------------------ */
+
 static void generate_keypair(void) {
-    uint8_t pub[32];
-    uint8_t priv[64];
-    uint8_t seed[32];
+    uint8_t seed[crypto_sign_SEEDBYTES];
+    uint8_t pub[crypto_sign_PUBLICKEYBYTES];
+    uint8_t priv[crypto_sign_SECRETKEYBYTES];
 
     get_random(seed, sizeof(seed));
-    ed25519_create_keypair(pub, priv, seed);
+
+    if (crypto_sign_seed_keypair(pub, priv, seed) != 0) {
+        fprintf(stderr, "keypair generation failed\n");
+        exit(1);
+    }
+
+    if (mkdir(KEY_DIR, 0700) < 0 && errno != EEXIST)
+        die("mkdir");
 
     FILE *f = fopen(KEY_PATH, "wb");
     if (!f) die("fopen priv");
-    if (fwrite(priv, 1, sizeof(priv), f) != sizeof(priv))
-        die("write priv");
+    fwrite(priv, 1, sizeof(priv), f);
     fclose(f);
     chmod(KEY_PATH, 0600);
 
     f = fopen(PUBKEY_PATH, "wb");
     if (!f) die("fopen pub");
-    if (fwrite(pub, 1, sizeof(pub), f) != sizeof(pub))
-        die("write pub");
+    fwrite(pub, 1, sizeof(pub), f);
     fclose(f);
 
-    secure_bzero(priv, sizeof(priv));
-    secure_bzero(seed, sizeof(seed));
+    sodium_memzero(seed, sizeof(seed));
+    sodium_memzero(priv, sizeof(priv));
 
-    fprintf(stderr, "[+] Ed25519 keypair generated\n");
+    fprintf(stderr, "[+] Ed25519 keys generated\n");
 }
 
-static int parse_mac(const char *str, uint8_t mac[6]) {
-    return sscanf(str,
-        "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-        &mac[0], &mac[1], &mac[2],
-        &mac[3], &mac[4], &mac[5]) == 6;
-}
+/* ------------------------------------------------ */
+/* Main                                             */
+/* ------------------------------------------------ */
 
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <ssid> <mac> <iface>\n", argv[0]);
-        return EXIT_FAILURE;
+        return 1;
     }
 
     const char *ssid = argv[1];
-    const char *mac_str = argv[2];
-    (void)argv[3]; // iface зарезервирован на будущее
+    const char *mac  = argv[2];
 
-    size_t ssid_len = strlen(ssid);
-    if (ssid_len == 0 || ssid_len > 32)
-        die("invalid SSID length");
-
-    uint8_t mac[6];
-    if (!parse_mac(mac_str, mac))
-        die("invalid MAC format");
-
-    if (!file_exists(KEY_DIR)) {
-        if (mkdir(KEY_DIR, 0700) < 0 && errno != EEXIST)
-            die("mkdir");
+    if (sodium_init() < 0) {
+        fprintf(stderr, "libsodium init failed\n");
+        return 1;
     }
 
     if (!file_exists(KEY_PATH) || !file_exists(PUBKEY_PATH)) {
         generate_keypair();
     }
 
-    /* Load private key */
-    uint8_t priv[64];
+    /* Load keys */
+    uint8_t pub[crypto_sign_PUBLICKEYBYTES];
+    uint8_t priv[crypto_sign_SECRETKEYBYTES];
+
     FILE *f = fopen(KEY_PATH, "rb");
-    if (!f) die("open privkey");
-    if (fread(priv, 1, sizeof(priv), f) != sizeof(priv))
-        die("read privkey");
+    if (!f) die("open priv");
+    fread(priv, 1, sizeof(priv), f);
     fclose(f);
 
-    /* Load public key */
-    uint8_t pub[32];
     f = fopen(PUBKEY_PATH, "rb");
-    if (!f) die("open pubkey");
-    if (fread(pub, 1, sizeof(pub), f) != sizeof(pub))
-        die("read pubkey");
+    if (!f) die("open pub");
+    fread(pub, 1, sizeof(pub), f);
     fclose(f);
 
-    /* Timestamp */
-    uint64_t ts = htobe64((uint64_t)time(NULL));
+    /* Build message to sign */
+    uint64_t ts = (uint64_t)time(NULL);
+    size_t ssid_len = strlen(ssid);
+    size_t mac_len  = strlen(mac);
 
-    /* Build signing buffer */
-    size_t sign_len = ssid_len + sizeof(mac) + sizeof(ts);
-    uint8_t *sign_buf = malloc(sign_len);
-    if (!sign_buf) die("malloc");
+    size_t msg_len = ssid_len + mac_len + sizeof(ts);
+    uint8_t *msg = malloc(msg_len);
+    if (!msg) die("malloc");
 
-    size_t off = 0;
-    memcpy(sign_buf + off, ssid, ssid_len); off += ssid_len;
-    memcpy(sign_buf + off, mac, sizeof(mac)); off += sizeof(mac);
-    memcpy(sign_buf + off, &ts, sizeof(ts));
+    memcpy(msg, ssid, ssid_len);
+    memcpy(msg + ssid_len, mac, mac_len);
+    memcpy(msg + ssid_len + mac_len, &ts, sizeof(ts));
 
     /* Sign */
-    // Объявляем буфер для хранения цифровой подписи.
-    uint8_t sig[64];
+    uint8_t sig[crypto_sign_BYTES];
+    unsigned long long siglen;
 
-    // Выполняем криптографическую подпись данных:
-    // - sig: буфер, куда будет записана результирующая подпись;
-    // - sign_buf: указатель на данные, которые нужно подписать;
-    // - sign_len: длина этих данных в байтах;
-    // - pub: публичный ключ;
-    // - priv: секретный ключ.
-    ed25519_sign(sig, sign_buf, sign_len, pub, priv);
+    if (crypto_sign_detached(sig, &siglen, msg, msg_len, priv) != 0) {
+        fprintf(stderr, "sign failed\n");
+        return 1;
+    }
 
-    // Очищаем секретный ключ из памяти после использования. 
-    // Это предотвращает утечку ключа через дамп памяти, своп или атаки по сторонним каналам.
-    secure_bzero(priv, sizeof(priv));
-
-    // Аналогично очищаем буфер с подписываемыми данными.
-    secure_bzero(sign_buf, sign_len);
-
-    // Освобождаем динамически выделенную память под буфер данных.
-    free(sign_buf);
+    free(msg);
+    sodium_memzero(priv, sizeof(priv));
 
     /* Build VSIE */
     uint8_t vsie[VSIE_LEN];
-    vsie[0] = OUI0;
-    vsie[1] = OUI1;
-    vsie[2] = OUI2;
-    vsie[3] = VSIE_TYPE;
 
-    memcpy(vsie + 4,  pub, 32);
-    memcpy(vsie + 36, &ts, 8);
-    memcpy(vsie + 44, sig, 64);
+    vsie[0] = 0x00;   /* OUI */
+    vsie[1] = 0x11;
+    vsie[2] = 0x22;
+    vsie[3] = 0x01;   /* Type */
+
+    memcpy(vsie + 4, pub, crypto_sign_PUBLICKEYBYTES);
+    memcpy(vsie + 4 + crypto_sign_PUBLICKEYBYTES, &ts, sizeof(ts));
+    memcpy(vsie + 4 + crypto_sign_PUBLICKEYBYTES + sizeof(ts),
+           sig, crypto_sign_BYTES);
 
     /* Output hex */
-    for (size_t i = 0; i < VSIE_LEN; i++)
+    for (size_t i = 0; i < sizeof(vsie); i++)
         printf("%02x", vsie[i]);
     printf("\n");
 
-    return EXIT_SUCCESS;
+    return 0;
 }
